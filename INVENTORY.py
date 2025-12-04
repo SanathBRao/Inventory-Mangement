@@ -1,287 +1,205 @@
 import streamlit as st
 import pandas as pd
+import sqlite3
+import hashlib
 from io import StringIO
 
-st.set_page_config(
-    page_title="Inventory Management",
-    page_icon="📦",
-    layout="wide"
-)
+# ================= AUTH & DATABASE ==================
 
-# ---------- Helpers ----------
-def init_inventory():
-    if "inventory" not in st.session_state:
-        st.session_state.inventory = pd.DataFrame(
-            columns=[
-                "Item ID",
-                "Name",
-                "Category",
-                "Quantity",
-                "Unit Price",
-                "Location"
-            ]
-        ).astype({
-            "Quantity": "int64",
-            "Unit Price": "float64"
-        })
+def get_connection():
+    return sqlite3.connect("inventory.db", check_same_thread=False)
 
-
-def generate_item_id():
-    """Generate a simple incremental Item ID like ITM-0001."""
-    df = st.session_state.inventory
-    if df.empty:
-        return "ITM-0001"
-    existing_ids = df["Item ID"].str.replace("ITM-", "").astype(int)
-    next_num = existing_ids.max() + 1
-    return f"ITM-{next_num:04d}"
-
-
-def add_or_update_item(item_id, name, category, quantity, price, location):
-    df = st.session_state.inventory
-
-    if item_id in df["Item ID"].values:
-        # Update existing
-        st.session_state.inventory.loc[
-            st.session_state.inventory["Item ID"] == item_id,
-            ["Name", "Category", "Quantity", "Unit Price", "Location"]
-        ] = [name, category, quantity, price, location]
-        st.success(f"Updated item {item_id}")
-    else:
-        # Add new
-        new_row = {
-            "Item ID": item_id,
-            "Name": name,
-            "Category": category,
-            "Quantity": quantity,
-            "Unit Price": price,
-            "Location": location,
-        }
-        st.session_state.inventory = pd.concat(
-            [df, pd.DataFrame([new_row])],
-            ignore_index=True
-        )
-        st.success(f"Added new item {item_id}")
-
-
-def delete_item(item_id):
-    df = st.session_state.inventory
-    st.session_state.inventory = df[df["Item ID"] != item_id].reset_index(drop=True)
-    st.success(f"Deleted item {item_id}")
-
-
-# ---------- Initialize ----------
-init_inventory()
-
-st.title("📦 Inventory Management Dashboard")
-
-# ---------- Sidebar ----------
-st.sidebar.header("⚙️ Settings & Data")
-
-# Import CSV
-uploaded_file = st.sidebar.file_uploader(
-    "Import inventory from CSV",
-    type=["csv"],
-    help="CSV must have columns: Item ID, Name, Category, Quantity, Unit Price, Location"
-)
-
-if uploaded_file is not None:
-    try:
-        csv_data = pd.read_csv(uploaded_file)
-        required_cols = ["Item ID", "Name", "Category", "Quantity", "Unit Price", "Location"]
-        if all(col in csv_data.columns for col in required_cols):
-            st.session_state.inventory = csv_data[required_cols]
-            st.sidebar.success("Inventory loaded from CSV.")
-        else:
-            st.sidebar.error(f"CSV missing required columns: {required_cols}")
-    except Exception as e:
-        st.sidebar.error(f"Error reading CSV: {e}")
-
-# Download CSV
-if not st.session_state.inventory.empty:
-    csv_buffer = StringIO()
-    st.session_state.inventory.to_csv(csv_buffer, index=False)
-    st.sidebar.download_button(
-        label="📥 Download inventory as CSV",
-        data=csv_buffer.getvalue(),
-        file_name="inventory_export.csv",
-        mime="text/csv",
+def create_tables():
+    conn = get_connection()
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE,
+            password TEXT,
+            role TEXT
+        );"""
     )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS inventory (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            item_id TEXT,
+            name TEXT,
+            category TEXT,
+            quantity INTEGER,
+            price REAL,
+            location TEXT
+        );"""
+    )
+    conn.commit()
+    conn.close()
 
-st.sidebar.markdown("---")
-low_stock_threshold = st.sidebar.number_input(
-    "Low stock threshold",
-    min_value=0,
-    value=5,
-    step=1,
-    help="Items with quantity <= this value are considered low stock."
-)
+def hash_password(password):
+    return hashlib.sha256(password.encode()).hexdigest()
 
-# ---------- Main Tabs ----------
-tab_manage, tab_view, tab_low = st.tabs(
-    ["➕ Add / Edit Item", "📋 View Inventory", "⚠️ Low Stock"]
-)
-
-# ---------- Tab: Add / Edit ----------
-with tab_manage:
-    st.subheader("Add or Edit Item")
-
-    col_left, col_right = st.columns(2)
-
-    with col_left:
-        mode = st.radio(
-            "Mode",
-            ["Add New Item", "Edit Existing Item"],
-            horizontal=True
+def add_user(username, password, role):
+    conn = get_connection()
+    try:
+        conn.execute(
+            "INSERT INTO users (username, password, role) VALUES (?, ?, ?)",
+            (username, hash_password(password), role)
         )
+        conn.commit()
+        return True
+    except:
+        return False
+    finally:
+        conn.close()
 
-    df = st.session_state.inventory
+def login_user(username, password):
+    conn = get_connection()
+    cursor = conn.execute(
+        "SELECT * FROM users WHERE username=? AND password=?",
+        (username, hash_password(password))
+    )
+    data = cursor.fetchone()
+    conn.close()
+    return data
 
-    if mode == "Edit Existing Item" and df.empty:
-        st.info("Inventory is empty. Switch to **Add New Item** to create your first item.")
+# ================= APP LOGIC ==================
 
-    if mode == "Add New Item":
-        col1, col2, col3 = st.columns(3)
+st.set_page_config(page_title="Inventory Management", layout="wide")
+create_tables()
+
+if "logged_in" not in st.session_state:
+    st.session_state.logged_in = False
+
+if "role" not in st.session_state:
+    st.session_state.role = None
+
+# ---------------- LOGIN / REGISTER UI ----------------
+
+if not st.session_state.logged_in:
+    tab1, tab2 = st.tabs(["🔐 Login", "📝 Register"])
+
+    with tab1:
+        st.subheader("Login")
+        username = st.text_input("Username")
+        password = st.text_input("Password", type="password")
+        if st.button("Login"):
+            user = login_user(username, password)
+            if user:
+                st.session_state.logged_in = True
+                st.session_state.user = username
+                st.session_state.role = user[3]
+                st.success(f"Welcome {username} ({st.session_state.role})")
+                st.rerun()
+            else:
+                st.error("Invalid username or password")
+
+    with tab2:
+        st.subheader("Create Account")
+        new_username = st.text_input("New Username")
+        new_password = st.text_input("New Password", type="password")
+        role = st.selectbox("Role", ["user", "admin"])
+        if st.button("Register"):
+            if add_user(new_username, new_password, role):
+                st.success("Registration successful! You can login now.")
+            else:
+                st.error("Username already exists!")
+
+    st.stop()
+
+# ================= After Login ==================
+
+st.sidebar.success(f"Logged in as: {st.session_state.user} ({st.session_state.role})")
+if st.sidebar.button("Logout"):
+    st.session_state.logged_in = False
+    st.rerun()
+
+# ================= Inventory Functions ==================
+
+def load_inventory():
+    conn = get_connection()
+    df = pd.read_sql_query("SELECT * FROM inventory", conn)
+    conn.close()
+    return df
+
+def save_item(item_id, name, category, quantity, price, location):
+    conn = get_connection()
+    conn.execute(
+        "INSERT INTO inventory (item_id, name, category, quantity, price, location) VALUES (?,?,?,?,?,?)",
+        (item_id, name, category, quantity, price, location)
+    )
+    conn.commit()
+    conn.close()
+
+def update_item(db_id, name, category, quantity, price, location):
+    conn = get_connection()
+    conn.execute(
+        "UPDATE inventory SET name=?, category=?, quantity=?, price=?, location=? WHERE id=?",
+        (name, category, quantity, price, location, db_id)
+    )
+    conn.commit()
+    conn.close()
+
+def delete_item(db_id):
+    conn = get_connection()
+    conn.execute("DELETE FROM inventory WHERE id=?", (db_id,))
+    conn.commit()
+    conn.close()
+
+# ================= Main UI ==================
+
+st.title("📦 Inventory Management System")
+
+df = load_inventory()
+
+tab_view, tab_add = st.tabs(["📋 View Inventory", "➕ Add Item"])
+
+# View Tab
+with tab_view:
+    st.header("Inventory List")
+
+    if df.empty:
+        st.info("No inventory records yet.")
+    else:
+        st.dataframe(df)
+
+        selected = st.selectbox("Select item to edit/delete", df["item_id"].tolist())
+        row = df[df["item_id"] == selected].iloc[0]
+
+        name = st.text_input("Name", row["name"])
+        category = st.text_input("Category", row["category"])
+        quantity = st.number_input("Quantity", value=row["quantity"], min_value=0)
+        price = st.number_input("Price", value=row["price"], min_value=0.0)
+        location = st.text_input("Location", row["location"])
+
+        col1, col2 = st.columns(2)
 
         with col1:
-            item_id = st.text_input(
-                "Item ID",
-                value=generate_item_id(),
-                help="You can change this if you want a custom ID.",
-            )
-            name = st.text_input("Name")
+            if st.button("Update"):
+                update_item(row["id"], name, category, quantity, price, location)
+                st.success("Updated Successfully")
+                st.rerun()
 
-        with col2:
-            category = st.text_input("Category")
-            quantity = st.number_input(
-                "Quantity",
-                min_value=0,
-                step=1,
-                value=0
-            )
-
-        with col3:
-            price = st.number_input(
-                "Unit Price",
-                min_value=0.0,
-                step=0.01,
-                value=0.0,
-                format="%.2f"
-            )
-            location = st.text_input("Location", placeholder="e.g., Rack A / Store Room")
-
-        if st.button("💾 Save Item", type="primary"):
-            if not name:
-                st.error("Name is required.")
-            else:
-                add_or_update_item(item_id, name, category, quantity, price, location)
-
-    else:  # Edit Existing
-        if not df.empty:
-            selected_id = st.selectbox(
-                "Select Item ID to edit",
-                df["Item ID"].tolist()
-            )
-
-            item_row = df[df["Item ID"] == selected_id].iloc[0]
-
-            col1, col2, col3 = st.columns(3)
-
-            with col1:
-                item_id = st.text_input("Item ID", value=item_row["Item ID"], disabled=True)
-                name = st.text_input("Name", value=item_row["Name"])
-
+        # Delete only for Admins
+        if st.session_state.role == "admin":
             with col2:
-                category = st.text_input("Category", value=item_row["Category"])
-                quantity = st.number_input(
-                    "Quantity",
-                    min_value=0,
-                    step=1,
-                    value=int(item_row["Quantity"])
-                )
+                if st.button("Delete"):
+                    delete_item(row["id"])
+                    st.success("Deleted Successfully")
+                    st.rerun()
 
-            with col3:
-                price = st.number_input(
-                    "Unit Price",
-                    min_value=0.0,
-                    step=0.01,
-                    value=float(item_row["Unit Price"]),
-                    format="%.2f"
-                )
-                location = st.text_input(
-                    "Location",
-                    value=str(item_row["Location"])
-                )
+# Add Item Tab (Admin Only)
+with tab_add:
+    if st.session_state.role != "admin":
+        st.warning("Only Admins can add new inventory items.")
+        st.stop()
 
-            col_save, col_delete = st.columns(2)
+    st.header("Add New Item")
+    item_id = st.text_input("Item ID")
+    name = st.text_input("Name")
+    category = st.text_input("Category")
+    quantity = st.number_input("Quantity", min_value=0)
+    price = st.number_input("Unit Price", min_value=0.0)
+    location = st.text_input("Location")
 
-            with col_save:
-                if st.button("💾 Update Item", type="primary"):
-                    if not name:
-                        st.error("Name is required.")
-                    else:
-                        add_or_update_item(item_id, name, category, quantity, price, location)
-
-            with col_delete:
-                if st.button("🗑️ Delete Item"):
-                    delete_item(item_id)
-        else:
-            st.warning("No items to edit.")
-
-# ---------- Tab: View Inventory ----------
-with tab_view:
-    st.subheader("Inventory Overview")
-
-    df = st.session_state.inventory.copy()
-
-    if df.empty:
-        st.info("No items in inventory yet.")
-    else:
-        # Filters
-        with st.expander("🔍 Filters", expanded=False):
-            col_f1, col_f2, col_f3 = st.columns(3)
-
-            with col_f1:
-                category_filter = st.text_input("Filter by category (contains)")
-            with col_f2:
-                location_filter = st.text_input("Filter by location (contains)")
-            with col_f3:
-                min_qty = st.number_input(
-                    "Min quantity",
-                    min_value=0,
-                    value=0,
-                    step=1
-                )
-
-        if category_filter:
-            df = df[df["Category"].str.contains(category_filter, case=False, na=False)]
-        if location_filter:
-            df = df[df["Location"].str.contains(location_filter, case=False, na=False)]
-        df = df[df["Quantity"] >= min_qty]
-
-        # Add total value column
-        df["Total Value"] = df["Quantity"] * df["Unit Price"]
-
-        st.metric(
-            "Total Inventory Value",
-            f"{df['Total Value'].sum():,.2f}"
-        )
-
-        st.dataframe(
-            df.reset_index(drop=True),
-            use_container_width=True
-        )
-
-# ---------- Tab: Low Stock ----------
-with tab_low:
-    st.subheader("⚠️ Low Stock Items")
-
-    df = st.session_state.inventory
-    if df.empty:
-        st.info("No items in inventory.")
-    else:
-        low_df = df[df["Quantity"] <= low_stock_threshold].copy()
-        if low_df.empty:
-            st.success("No items are currently below the low stock threshold.")
-        else:
-            st.warning(f"{len(low_df)} item(s) are at or below the threshold ({low_stock_threshold}).")
-            st.dataframe(low_df.reset_index(drop=True), use_container_width=True)
+    if st.button("Add Item"):
+        save_item(item_id, name, category, quantity, price, location)
+        st.success("Item added successfully")
+        st.rerun()
